@@ -12,8 +12,8 @@ const CHANNEL_ID = process.env.CHANNEL_ID;
 
 // Masa Node API Configuration
 const MASA_API_URL = 'http://localhost:8080/api/v1/data/twitter/tweets/recent';
-const TWITTER_QUERY = '(#XRPLEVM) (from:Peersyst)';
 const TWEET_COUNT = 5;
+const TWITTER_QUERY = '(#XRPLEVM) (from:Peersyst)';
 
 // Retry Configuration
 const MAX_RETRIES = 9; // Maximum retries
@@ -38,8 +38,38 @@ const saveTweet = (tweet) => {
         time: tweet.TimeParsed,
         snippet: tweet.Text.substring(0, 20),
     };
-    fs.appendFileSync(LOG_FILE, JSON.stringify(tweetInfo) + '\n');
-    log('INFO', `Tweet saved: ${JSON.stringify(tweetInfo)}`);
+
+    try {
+        // Read the existing log file, or initialize an empty array if it doesn't exist
+        let tweetsLog = [];
+        if (fs.existsSync(LOG_FILE)) {
+            const data = fs.readFileSync(LOG_FILE, 'utf8');
+            tweetsLog = JSON.parse(data);
+        }
+
+        // Add the new tweet
+        tweetsLog.push(tweetInfo);
+
+        // Write the updated array back to the file
+        fs.writeFileSync(LOG_FILE, JSON.stringify(tweetsLog, null, 4));
+        log('INFO', `Tweet saved: ${JSON.stringify(tweetInfo)}`);
+    } catch (error) {
+        log('ERROR', `Failed to save tweet: ${error.message}`);
+    }
+};
+
+// Utility function: Generate dynamic Twitter query with date range
+const generateTwitterQuery = () => {
+    const today = new Date();
+    const threeDaysAgo = new Date(today);
+    threeDaysAgo.setDate(today.getDate() - 3);
+
+    const formatDate = (date) => date.toISOString().split('T')[0];
+
+    const since = formatDate(threeDaysAgo);
+    const until = formatDate(today);
+
+    return `(${TWITTER_QUERY}) since:${since} until:${until}`;
 };
 
 // Exponential backoff
@@ -50,10 +80,13 @@ const queryMasaNode = async (retryCount = 0) => {
     log('INFO', `Starting query for tweets (attempt: ${retryCount + 1})`);
 
     try {
+        const twitterQuery = generateTwitterQuery();
+        log('INFO', `Using query: ${twitterQuery}`);
+
         const response = await axios.post(
             MASA_API_URL,
             {
-                query: TWITTER_QUERY,
+                query: twitterQuery,
                 count: TWEET_COUNT,
             },
             { timeout: REQUEST_TIMEOUT }
