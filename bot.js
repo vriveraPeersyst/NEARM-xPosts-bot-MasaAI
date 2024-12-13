@@ -16,10 +16,10 @@ const TWITTER_QUERY = '(#XRPLEVM) (from:Peersyst)';
 const TWEET_COUNT = 5;
 
 // Retry Configuration
-const MAX_RETRIES = 33; // Maximum retries
+const MAX_RETRIES = 9; // Maximum retries
 const REQUEST_TIMEOUT = 60 * 1000; // Timeout for requests in milliseconds
-const RETRY_DELAY = 1111; // Retry delay in milliseconds (16 minutes)
-const REQUEST_DELAY = 33 * 1000; // Request delay in milliseconds (15 seconds)
+const RETRY_DELAY = 30000; // Retry delay in milliseconds (16 minutes)
+const REQUEST_DELAY = 27 * 60000; // Request delay in milliseconds (15 seconds)
 
 // Logging
 const LOG_FILE = 'tweets-log.json';
