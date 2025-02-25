@@ -10,47 +10,42 @@ const client = new Client({
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const CHANNEL_ID = process.env.CHANNEL_ID;
 
-// Masa Node API Configuration
-const MASA_API_URL = 'http://localhost:8080/api/v1/data/twitter/tweets/recent';
+// Masa API Configuration (New Endpoints)
+const MASA_API_BASE_URL = 'https://api1.dev.masalabs.ai';
+const MASA_SEARCH_ENDPOINT = `${MASA_API_BASE_URL}/v1/search/twitter`;
 const TWEET_COUNT = 5;
 const TWITTER_QUERY = '(#XRPLEVM) (from:Peersyst)';
 
-// Retry Configuration
-const MAX_RETRIES = 9; // Maximum retries
-const REQUEST_TIMEOUT = 60 * 1000; // Timeout for requests in milliseconds
-const RETRY_DELAY = 30000; // Retry delay in milliseconds (16 minutes)
-const REQUEST_DELAY = 27 * 60000; // Request delay in milliseconds (15 seconds)
+// Retry & Delay Configuration
+const MAX_RETRIES = 9;
+const REQUEST_TIMEOUT = 60 * 1000; // 1 minute
+const RETRY_DELAY = 30000; // 30 seconds (base delay)
+const REQUEST_DELAY = 27 * 60000; // 27 minutes
 
-// Logging
+// Logging and Persistence
 const LOG_FILE = 'tweets-log.json';
-const fetchedTweets = new Set(); // Store tweet IDs to prevent duplicates
+const fetchedTweets = new Set();
 
-// Utility function: Log messages with timestamp
 const log = (level, message) => {
     const timestamp = new Date().toISOString();
     console.log(`[${timestamp}] [${level}] ${message}`);
 };
 
-// Utility function: Save tweet details to log file
+// Save tweet details to file (adapted for new tweet structure)
 const saveTweet = (tweet) => {
     const tweetInfo = {
-        link: tweet.PermanentURL,
-        time: tweet.TimeParsed,
-        snippet: tweet.Text.substring(0, 20),
+        id: tweet.ID,
+        content: tweet.Content,
+        snippet: tweet.Content.substring(0, 20)
     };
 
     try {
-        // Read the existing log file, or initialize an empty array if it doesn't exist
         let tweetsLog = [];
         if (fs.existsSync(LOG_FILE)) {
             const data = fs.readFileSync(LOG_FILE, 'utf8');
             tweetsLog = JSON.parse(data);
         }
-
-        // Add the new tweet
         tweetsLog.push(tweetInfo);
-
-        // Write the updated array back to the file
         fs.writeFileSync(LOG_FILE, JSON.stringify(tweetsLog, null, 4));
         log('INFO', `Tweet saved: ${JSON.stringify(tweetInfo)}`);
     } catch (error) {
@@ -58,63 +53,116 @@ const saveTweet = (tweet) => {
     }
 };
 
-// Utility function: Generate dynamic Twitter query with date range
+// Generate a dynamic Twitter query with a date range
 const generateTwitterQuery = () => {
     const today = new Date();
     const threeDaysAgo = new Date(today);
     threeDaysAgo.setDate(today.getDate() - 3);
-
     const formatDate = (date) => date.toISOString().split('T')[0];
-
     const since = formatDate(threeDaysAgo);
     const until = formatDate(today);
-
     return `(${TWITTER_QUERY}) since:${since} until:${until}`;
 };
 
-// Exponential backoff
+// Exponential backoff helper
 const exponentialBackoff = (attempt, base) => base * 2 ** attempt;
 
-// Query Masa Node
+// Poll the job status until it's done
+const pollJobStatus = async (jobUUID, retryCount = 0) => {
+    try {
+        const statusResponse = await axios.get(
+            `${MASA_API_BASE_URL}/v1/search/twitter/status/${jobUUID}`,
+            {
+                headers: {
+                    'Authorization': `Bearer ${process.env.MASA_API_KEY}`
+                },
+                timeout: REQUEST_TIMEOUT
+            }
+        );
+        const status = statusResponse.data.status;
+        if (status === 'done') {
+            log('INFO', `Job ${jobUUID} completed.`);
+            return;
+        } else if (status === 'processing') {
+            log('INFO', `Job ${jobUUID} is still processing...`);
+            await new Promise(resolve => setTimeout(resolve, 5000)); // wait 5 seconds
+            return pollJobStatus(jobUUID, retryCount);
+        } else {
+            throw new Error(`Job status error: ${status}`);
+        }
+    } catch (error) {
+        if (retryCount < MAX_RETRIES) {
+            const delay = exponentialBackoff(retryCount, RETRY_DELAY);
+            log('ERROR', `Error checking job status. Retrying in ${delay / 1000} seconds. Error: ${error.message}`);
+            await new Promise(resolve => setTimeout(resolve, delay));
+            return pollJobStatus(jobUUID, retryCount + 1);
+        } else {
+            throw error;
+        }
+    }
+};
+
+// Query Masa: submit job, poll status, retrieve results, and post tweets to Discord
 const queryMasaNode = async (retryCount = 0) => {
     log('INFO', `Starting query for tweets (attempt: ${retryCount + 1})`);
-
     try {
         const twitterQuery = generateTwitterQuery();
         log('INFO', `Using query: ${twitterQuery}`);
 
-        const response = await axios.post(
-            MASA_API_URL,
+        // Submit X/Twitter search job
+        const searchResponse = await axios.post(
+            MASA_SEARCH_ENDPOINT,
             {
                 query: twitterQuery,
-                count: TWEET_COUNT,
+                max_results: TWEET_COUNT
             },
-            { timeout: REQUEST_TIMEOUT }
+            {
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${process.env.MASA_API_KEY}`
+                },
+                timeout: REQUEST_TIMEOUT
+            }
         );
 
-        if (response.data && response.data.data) {
-            const tweets = response.data.data;
-            log('INFO', `Fetched ${tweets.length} tweets.`);
+        if (!searchResponse.data.uuid) {
+            log('WARN', 'No job UUID returned from search submission.');
+            throw new Error('No job UUID returned');
+        }
+        const jobUUID = searchResponse.data.uuid;
+        log('INFO', `Search job submitted. Job UUID: ${jobUUID}`);
 
-            for (const tweetObj of tweets) {
-                const tweet = tweetObj.Tweet;
-                if (!fetchedTweets.has(tweet.ID)) {
-                    fetchedTweets.add(tweet.ID);
-                    saveTweet(tweet);
+        // Poll until the job is complete
+        await pollJobStatus(jobUUID);
 
-                    // Post to Discord channel
-                    const channel = await client.channels.fetch(CHANNEL_ID);
-                    await channel.send(`📣 ${tweet.PermanentURL}`);
-                    log('INFO', `Tweet posted to Discord: ${tweet.PermanentURL}`);
-                } else {
-                    log('INFO', `Duplicate tweet skipped: ${tweet.ID}`);
-                }
+        // Retrieve the search results
+        const resultResponse = await axios.get(
+            `${MASA_API_BASE_URL}/v1/search/twitter/result/${jobUUID}`,
+            {
+                headers: {
+                    'Authorization': `Bearer ${process.env.MASA_API_KEY}`
+                },
+                timeout: REQUEST_TIMEOUT
             }
-        } else {
-            log('WARN', 'No tweets found.');
+        );
+        const tweets = resultResponse.data;
+        log('INFO', `Fetched ${tweets.length} tweets.`);
+
+        for (const tweet of tweets) {
+            if (!fetchedTweets.has(tweet.ID)) {
+                fetchedTweets.add(tweet.ID);
+                saveTweet(tweet);
+                // Construct a tweet URL using the tweet ID
+                const tweetURL = `https://twitter.com/i/status/${tweet.ID}`;
+                const channel = await client.channels.fetch(CHANNEL_ID);
+                await channel.send(`📣 ${tweetURL}`);
+                log('INFO', `Tweet posted to Discord: ${tweetURL}`);
+            } else {
+                log('INFO', `Duplicate tweet skipped: ${tweet.ID}`);
+            }
         }
 
-        // Apply delay between requests
+        // Delay before next query cycle
         setTimeout(queryMasaNode, REQUEST_DELAY);
 
     } catch (error) {
@@ -128,11 +176,11 @@ const queryMasaNode = async (retryCount = 0) => {
     }
 };
 
-// When the bot is ready
+// When the bot is ready, start tweet monitoring
 client.once('ready', () => {
     log('INFO', `Logged in as ${client.user.tag}`);
     log('INFO', 'Starting tweet monitoring...');
-    queryMasaNode(); // Start the query loop
+    queryMasaNode();
 });
 
 // Log in to Discord
