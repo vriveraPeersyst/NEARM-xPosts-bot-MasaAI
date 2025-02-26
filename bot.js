@@ -14,13 +14,13 @@ const CHANNEL_ID = process.env.CHANNEL_ID;
 const MASA_API_BASE_URL = 'https://api1.dev.masalabs.ai';
 const MASA_SEARCH_ENDPOINT = `${MASA_API_BASE_URL}/v1/search/twitter`;
 const TWEET_COUNT = 5;
-const TWITTER_QUERY = '(#XRPLEVM) (from:Peersyst)';
+const TWITTER_QUERY = '#XRPLEVM from:XrplSpain';
 
 // Retry & Delay Configuration
 const MAX_RETRIES = 9;
 const REQUEST_TIMEOUT = 60 * 1000; // 1 minute
 const RETRY_DELAY = 30000; // 30 seconds (base delay)
-const REQUEST_DELAY = 27 * 60000; // 27 minutes
+const REQUEST_DELAY = 1 * 60000; // 1 minute
 
 // Logging and Persistence
 const LOG_FILE = 'tweets-log.json';
@@ -61,11 +61,11 @@ const generateTwitterQuery = () => {
     const formatDate = (date) => date.toISOString().split('T')[0];
     const since = formatDate(threeDaysAgo);
     const until = formatDate(today);
-    return `(${TWITTER_QUERY}) since:${since} until:${until}`;
+    return `${TWITTER_QUERY} since:${since} until:${until}`;
 };
 
 // Exponential backoff helper
-const exponentialBackoff = (attempt, base) => base * 2 ** attempt;
+const exponentialBackoff = (attempt, base) => base * 1.1 ** attempt;
 
 // Poll the job status until it's done
 const pollJobStatus = async (jobUUID, retryCount = 0) => {
@@ -123,7 +123,10 @@ const queryMasaNode = async (retryCount = 0) => {
                 },
                 timeout: REQUEST_TIMEOUT
             }
+            
         );
+
+        console.log(searchResponse);
 
         if (!searchResponse.data.uuid) {
             log('WARN', 'No job UUID returned from search submission.');
