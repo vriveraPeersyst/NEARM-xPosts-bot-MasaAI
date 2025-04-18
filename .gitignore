@@ -1,3 +1,6 @@
 .env
 node_modules
 package-lock.json
+tweets-log-nearmobile_app.json
+tweets-log-nearprotocol.json
+.DS_Store
