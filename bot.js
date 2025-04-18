@@ -30,7 +30,7 @@ const SEARCH_EP     = `${MASA_API_BASE}/v1/search/live/twitter`;
 
 /* ──────────  Timing  ────────── */
 const REQUEST_TIMEOUT = 60_000;
-const CYCLE_DELAY     = 60_000;      // per‑account cycle
+const CYCLE_DELAY     = 300_000;      // per‑account cycle
 const RETRY_DELAY     = 5_000;       // shorter for debugging
 const MAX_RETRIES     = 3;
 
