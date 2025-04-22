@@ -101,8 +101,9 @@ async function poll(uuid){
 function startLoop(acct){
   initState(acct);
   const run = async (retry=0) => {
-    log('INFO', `Cycle start for @${acct.handle}`);
+    log('INFO', `Cycle start for @${acct.handle} (retry=${retry})`);
     try{
+      // kick off search job
       const { data:{ uuid, error } } = await axios.post(
         SEARCH_EP,
         { query:`from:${acct.handle}`, max_results:10 },
@@ -111,13 +112,16 @@ function startLoop(acct){
       if(error) throw new Error(error);
       if(!uuid) throw new Error('no uuid');
 
+      // wait for completion
       await poll(uuid);
+      // fetch results
       const { data:tweets } = await axios.get(
         `${MASA_API_BASE}/v1/search/live/twitter/result/${uuid}`,
         { headers:{ Authorization:`Bearer ${MASA_API_KEY}` }, timeout:REQUEST_TIMEOUT }
       );
       log('INFO', `@${acct.handle} fetched ${tweets.length}`);
 
+      // filter and post
       const chan = await client.channels.fetch(CHANNEL_ID);
       const newTweets = tweets
         .filter(t => {
@@ -135,15 +139,17 @@ function startLoop(acct){
         await chan.send(`𝕏 : [New Post from ${t.Metadata.username}](https://twitter.com/i/status/${id})`);
         log('INFO', `@${acct.handle} posted ${id}`);
       }
-
-      setTimeout(run, CYCLE_DELAY);
-    }catch(e){
-      if(retry<MAX_RETRIES){
-        log('WARN', `@${acct.handle} err ${e.message}, retry ${RETRY_DELAY/1000}s`);
-        setTimeout(()=>run(retry+1), RETRY_DELAY);
-      }else{
-        log('ERROR', `@${acct.handle} aborted after ${MAX_RETRIES}`);
+    } catch(e) {
+      // retry logic
+      if(retry < MAX_RETRIES) {
+        log('WARN', `@${acct.handle} err ${e.message}, retry in ${RETRY_DELAY/1000}s`);
+        setTimeout(() => run(retry + 1), RETRY_DELAY);
+        return;
       }
+      log('ERROR', `@${acct.handle} failed ${MAX_RETRIES} times, will retry next cycle`);
+    } finally {
+      // always schedule next full cycle
+      setTimeout(() => run(0), CYCLE_DELAY);
     }
   };
   run();
@@ -153,3 +159,7 @@ function startLoop(acct){
 const client = new Client({ intents:[GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages] });
 client.once('ready',()=>{ log('INFO', `Logged in as ${client.user.tag}`); ACCOUNTS.forEach(startLoop); });
 client.login(DISCORD_TOKEN);
+
+// prevent the bot process from crashing on unexpected errors
+process.on('uncaughtException',  err => log('ERROR', `uncaughtException: ${err.stack}`));
+process.on('unhandledRejection', err => log('ERROR', `unhandledRejection: ${err}`));
