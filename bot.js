@@ -1,11 +1,12 @@
 /**
- *  NEARM‑xPosts Discord bot — DEBUG build (18 Apr 2025)
+ *  NEARM-xPosts Discord bot — RELEASE build (May 2025)
  *  • watches @NEARMobile_app and @NEARProtocol
  *  • one job per account, separate logs
  *  • verbose Axios interceptors to surface every error
- *  • filters out Retweets and non-original tweets (mentions), posting only authored tweets
+ *  • filters out Retweets and non-original tweets (mentions)
  *  • posts oldest new tweets first
- *  • caps polling attempts so it doesn’t hang indefinitely
+ *  • submits one search per cycle, polls same job up to 5× every 2 min
+ *  • schedules next cycle 20 min after completion or error
  */
 
 const { Client, GatewayIntentBits } = require('discord.js');
@@ -13,153 +14,196 @@ const axios  = require('axios');
 const fs     = require('fs');
 require('dotenv').config();
 
-/* ──────────  Accounts  ────────── */
+/* ────────── Accounts ────────── */
 const ACCOUNTS = [
   { handle: 'NEARMobile_app', lower: 'nearmobile_app' },
   { handle: 'NEARProtocol',   lower: 'nearprotocol'   },
 ];
 
-/* ──────────  ENV  ────────── */
-const DISCORD_TOKEN = process.env.DISCORD_TOKEN?.trim();
-const CHANNEL_ID    = process.env.CHANNEL_ID?.trim();
-const MASA_API_KEY  = process.env.MASA_API_KEY?.trim();
+/* ────────── ENV ────────── */
+const DISCORD_TOKEN         = process.env.DISCORD_TOKEN?.trim();
+const CHANNEL_ID            = process.env.CHANNEL_ID?.trim();
+const MASA_API_KEY          = process.env.MASA_API_KEY?.trim();
+const MASA_DATA_SOURCE_TYPE = process.env.MASA_DATA_SOURCE_TYPE?.trim() || 'twitter-scraper';
+const MASA_SEARCH_METHOD    = process.env.MASA_SEARCH_METHOD?.trim()    || 'searchbyquery';
+// decreased default max_results from 25 to 10
+const MASA_MAX_RESULTS      = Number(process.env.MASA_MAX_RESULTS)      || 10;
+
 if (!DISCORD_TOKEN || !CHANNEL_ID || !MASA_API_KEY) {
-  console.error('⛔  Missing .env values'); process.exit(1);
+  console.error('⛔  Missing .env values');
+  process.exit(1);
 }
 
-/* ──────────  Masa API  ────────── */
+/* ────────── Masa API ────────── */
 const MASA_API_BASE = 'https://data.dev.masalabs.ai/api';
 const SEARCH_EP     = `${MASA_API_BASE}/v1/search/live/twitter`;
 
-/* ──────────  Timing  ────────── */
+/* ────────── Timing ────────── */
 const REQUEST_TIMEOUT    = 60_000;
-const MAX_POLL_ATTEMPTS  = 3;      // at 5s interval = 60s max polling
-const CYCLE_DELAY        = 600_000; // per‑account cycle (5 min)
-const RETRY_DELAY        = 15_000;   // shorter for debugging
-const MAX_RETRIES        = 3;
+const MAX_POLL_ATTEMPTS  = 5;        // increased from 3 to 5
+const POLL_INTERVAL      = 120_000;  // increased from 30s to 2min
+const CYCLE_DELAY        = 1_200_000; // 20 min between cycles
 
-/* ──────────  Logger  ────────── */
-const log = (lv,msg)=>console.log(`[${new Date().toISOString()}] [${lv}] ${msg}`);
+/* ────────── Logger ────────── */
+const log = (lv, msg) => console.log(`[${new Date().toISOString()}] [${lv}] ${msg}`);
 
-/* ──────────  Axios interceptors  ────────── */
+/* ────────── Axios interceptors ────────── */
 axios.interceptors.request.use(
-  r=>{log('DEBUG',`Req: ${JSON.stringify(r,null,2)}`);return r;},
-  e=>{log('ERROR',`Req error: ${e.message}`);return Promise.reject(e);}
+  req => { log('DEBUG', `Req: ${JSON.stringify(req, null, 2)}`); return req; },
+  err => { log('ERROR', `Req error: ${err.message}`); return Promise.reject(err); }
 );
 axios.interceptors.response.use(
-  r=>{log('DEBUG',`Res: ${JSON.stringify(r.data,null,2)}`);return r;},
-  e=>{
-    if(e.response) log('ERROR',`Res err: ${JSON.stringify(e.response.data)}`);
-    else            log('ERROR',`Err: ${e.message}`);
-    return Promise.reject(e);
+  res => { log('DEBUG', `Res: ${JSON.stringify(res.data, null, 2)}`); return res; },
+  err => {
+    if (err.response) log('ERROR', `Res err: ${JSON.stringify(err.response.data)}`);
+    else              log('ERROR', `Err: ${err.message}`);
+    return Promise.reject(err);
   }
 );
 
-/* ──────────  Helpers  ────────── */
+/* ────────── Helpers ────────── */
 const realID      = t => String(t.ExternalID ?? t.Metadata?.tweet_id ?? t.ID ?? '');
 const IN_PROGRESS = ['processing','in progress','queued','error(retrying)'];
 
-/* ──────────  Per‑account state ────────── */
-function initState(a){
-  a.logFile = `tweets-log-${a.lower}.json`;
-  a.seen    = new Set();
-  if(fs.existsSync(a.logFile)){
-    try{JSON.parse(fs.readFileSync(a.logFile,'utf8')).forEach(t=>a.seen.add(String(t.id)));}catch{}
+/* ────────── Per-account state ────────── */
+function initState(acct) {
+  acct.logFile = `tweets-log-${acct.lower}.json`;
+  acct.seen    = new Set();
+  if (fs.existsSync(acct.logFile)) {
+    try {
+      JSON.parse(fs.readFileSync(acct.logFile, 'utf8'))
+        .forEach(e => acct.seen.add(String(e.id)));
+    } catch {}
   }
 }
 
-function save(a,t,id){
-  const entry = { id, content: t.Content, snippet: t.Content.slice(0,20) };
-  try{
-    const arr = fs.existsSync(a.logFile)
-      ? JSON.parse(fs.readFileSync(a.logFile,'utf8'))
+function save(acct, tweet, id) {
+  const entry = { id, content: tweet.Content, snippet: tweet.Content.slice(0,20) };
+  try {
+    const arr = fs.existsSync(acct.logFile)
+      ? JSON.parse(fs.readFileSync(acct.logFile, 'utf8'))
       : [];
     arr.push(entry);
-    fs.writeFileSync(a.logFile, JSON.stringify(arr,null,2));
-  }catch(e){ log('ERROR',`save fail (${a.handle}): ${e.message}`); }
+    fs.writeFileSync(acct.logFile, JSON.stringify(arr, null, 2));
+  } catch (e) {
+    log('ERROR', `save fail (${acct.handle}): ${e.message}`);
+  }
 }
 
-/* ──────────  Poll status with cap ────────── */
-async function poll(uuid){
-  let attempts = 0;
-  while(attempts < MAX_POLL_ATTEMPTS){
+/* ────────── Step 1: submit search ────────── */
+async function submitSearch(handle) {
+  const { data } = await axios.post(
+    SEARCH_EP,
+    {
+      type: MASA_DATA_SOURCE_TYPE,
+      arguments: {
+        type: MASA_SEARCH_METHOD,
+        query: `from:${handle}`,
+        max_results: MASA_MAX_RESULTS
+      }
+    },
+    {
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${MASA_API_KEY}`
+      },
+      timeout: REQUEST_TIMEOUT
+    }
+  );
+  if (data.error) throw new Error(data.error);
+  if (!data.uuid) throw new Error('no uuid returned');
+  return data.uuid;
+}
+
+/* ────────── Step 2: poll status ────────── */
+async function pollUntilDone(uuid) {
+  for (let attempt = 1; attempt <= MAX_POLL_ATTEMPTS; attempt++) {
     const { data } = await axios.get(
       `${MASA_API_BASE}/v1/search/live/twitter/status/${uuid}`,
-      { headers:{ Authorization:`Bearer ${MASA_API_KEY}` }, timeout:REQUEST_TIMEOUT }
+      {
+        headers: { Authorization: `Bearer ${MASA_API_KEY}` },
+        timeout: REQUEST_TIMEOUT
+      }
     );
     log('DEBUG', `Job ${uuid} status: ${data.status}`);
-    if(data.status === 'done') return;
-    if(!IN_PROGRESS.includes(data.status))
-      throw new Error(`status "${data.status}"`);
-    attempts++;
-    await new Promise(r=>setTimeout(r,5_000));
+    if (data.status === 'done') return true;
+    if (!IN_PROGRESS.includes(data.status)) {
+      throw new Error(`job failed with status "${data.status}"`);
+    }
+    await new Promise(r => setTimeout(r, POLL_INTERVAL));
   }
-  log('WARN', `Job ${uuid} still in progress after ${MAX_POLL_ATTEMPTS} attempts; moving on`);
+  log('WARN', `Job ${uuid} still in progress after ${MAX_POLL_ATTEMPTS} polls`);
+  return false;
 }
 
-/* ──────────  Account loop ────────── */
-function startLoop(acct){
-  initState(acct);
-  const run = async (retry=0) => {
-    log('INFO', `Cycle start for @${acct.handle} (retry=${retry})`);
-    try{
-      // kick off search job
-      const { data:{ uuid, error } } = await axios.post(
-        SEARCH_EP,
-        { query:`from:${acct.handle}`, max_results:10 },
-        { headers:{ 'Content-Type':'application/json', Authorization:`Bearer ${MASA_API_KEY}` }, timeout:REQUEST_TIMEOUT }
-      );
-      if(error) throw new Error(error);
-      if(!uuid) throw new Error('no uuid');
-
-      // wait for completion
-      await poll(uuid);
-      // fetch results
-      const { data:tweets } = await axios.get(
-        `${MASA_API_BASE}/v1/search/live/twitter/result/${uuid}`,
-        { headers:{ Authorization:`Bearer ${MASA_API_KEY}` }, timeout:REQUEST_TIMEOUT }
-      );
-      log('INFO', `@${acct.handle} fetched ${tweets.length}`);
-
-      // filter and post
-      const chan = await client.channels.fetch(CHANNEL_ID);
-      const newTweets = tweets
-        .filter(t => {
-          const txt = t.Content;
-          const user= t.Metadata?.username?.toLowerCase()||'';
-          return user===acct.lower && !txt.startsWith('RT ') && !txt.startsWith('@');
-        })
-        .reverse();
-
-      for(const t of newTweets){
-        const id = realID(t);
-        if(!id||acct.seen.has(id)) continue;
-        acct.seen.add(id);
-        save(acct,t,id);
-        await chan.send(`𝕏 : [New Post from ${t.Metadata.username}](https://twitter.com/i/status/${id})`);
-        log('INFO', `@${acct.handle} posted ${id}`);
-      }
-    } catch(e) {
-      // retry logic
-      if(retry < MAX_RETRIES) {
-        log('WARN', `@${acct.handle} err ${e.message}, retry in ${RETRY_DELAY/1000}s`);
-        setTimeout(() => run(retry + 1), RETRY_DELAY);
-        return;
-      }
-      log('ERROR', `@${acct.handle} failed ${MAX_RETRIES} times, will retry next cycle`);
-    } finally {
-      // always schedule next full cycle
-      setTimeout(() => run(0), CYCLE_DELAY);
+/* ────────── Step 3: fetch results ────────── */
+async function fetchResults(uuid) {
+  const { data: tweets } = await axios.get(
+    `${MASA_API_BASE}/v1/search/live/twitter/result/${uuid}`,
+    {
+      headers: { Authorization: `Bearer ${MASA_API_KEY}` },
+      timeout: REQUEST_TIMEOUT
     }
-  };
+  );
+  return tweets;
+}
+
+/* ────────── Account loop ────────── */
+function startLoop(acct) {
+  initState(acct);
+
+  async function run() {
+    log('INFO', `Cycle start for @${acct.handle}`);
+    try {
+      // 1) submit
+      const uuid = await submitSearch(acct.handle);
+
+      // 2) poll
+      const done = await pollUntilDone(uuid);
+      if (!done) return;
+
+      // 3) fetch
+      const tweets = await fetchResults(uuid);
+      log('INFO', `@${acct.handle} fetched ${Array.isArray(tweets) ? tweets.length : 0} tweets`);
+      if (!Array.isArray(tweets)) return;
+
+      // filter & post
+      const chan = await client.channels.fetch(CHANNEL_ID);
+      tweets
+        .filter(t => {
+          const txt = t.Content || '';
+          return !txt.startsWith('RT ') && !txt.startsWith('@');
+        })
+        .reverse()
+        .forEach(async t => {
+          const id = realID(t);
+          if (!id || acct.seen.has(id)) return;
+          acct.seen.add(id);
+          save(acct, t, id);
+          await chan.send(`𝕏 : [New Post from @${acct.handle}](https://twitter.com/i/status/${id})`);
+          log('INFO', `@${acct.handle} posted ${id}`);
+        });
+
+    } catch (err) {
+      log('ERROR', `@${acct.handle} error: ${err.message}`);
+    } finally {
+      setTimeout(run, CYCLE_DELAY);
+    }
+  }
+
   run();
 }
 
-/* ──────────  Discord init ────────── */
-const client = new Client({ intents:[GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages] });
-client.once('ready',()=>{ log('INFO', `Logged in as ${client.user.tag}`); ACCOUNTS.forEach(startLoop); });
+/* ────────── Discord init ────────── */
+const client = new Client({
+  intents: [ GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages ]
+});
+client.once('ready', () => {
+  log('INFO', `Logged in as ${client.user.tag}`);
+  ACCOUNTS.forEach(startLoop);
+});
 client.login(DISCORD_TOKEN);
 
-// prevent the bot process from crashing on unexpected errors
-process.on('uncaughtException',  err => log('ERROR', `uncaughtException: ${err.stack}`));
-process.on('unhandledRejection', err => log('ERROR', `unhandledRejection: ${err}`));
+// prevent crashes on unhandled errors
+process.on('uncaughtException',  e => log('ERROR', `uncaughtException: ${e.stack}`));
+process.on('unhandledRejection', e => log('ERROR', `unhandledRejection: ${e}`));
